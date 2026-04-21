@@ -5,69 +5,63 @@ const fetch   = (...args) => import('node-fetch').then(({default: f}) => f(...ar
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ── Your API keys live here on the server, never sent to users ──
-const GOOGLE_KEY     = process.env.GOOGLE_PLACES_KEY;
-const ANTHROPIC_KEY  = process.env.ANTHROPIC_KEY;
+const GOOGLE_KEY    = process.env.GOOGLE_PLACES_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_KEY;
 
 app.use(cors());
 app.use(express.json());
 
-// ── Health check ──────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ProfileScout API running' });
 });
 
-// ── SEARCH: find businesses via Google Places ─────────────────
-// GET /api/search?query=restaurants+in+Austin+TX
 app.get('/api/search', async (req, res) => {
   const { query } = req.query;
-  if (!query) return res.status(400).json({ error: 'query is required' });
+  if (!query)      return res.status(400).json({ error: 'query is required' });
   if (!GOOGLE_KEY) return res.status(500).json({ error: 'Google API key not configured on server' });
 
   try {
-    // Step 1: Text search
-    const searchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${GOOGLE_KEY}`;
-    const searchRes  = await fetch(searchUrl);
+    const searchRes = await fetch(
+      'https://places.googleapis.com/v1/places:searchText',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': GOOGLE_KEY,
+          'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri,places.rating,places.userRatingCount,places.photos,places.regularOpeningHours,places.types',
+        },
+        body: JSON.stringify({ textQuery: query, maxResultCount: 12 }),
+      }
+    );
+
     const searchData = await searchRes.json();
 
-    if (searchData.status === 'REQUEST_DENIED') {
-      return res.status(403).json({ error: 'Google API key invalid or Places API not enabled.' });
+    if (searchData.error) {
+      console.error('Google error:', JSON.stringify(searchData.error));
+      return res.status(403).json({ error: `Google API error: ${searchData.error.message}` });
     }
-    if (!searchData.results?.length) {
+
+    if (!searchData.places?.length) {
       return res.json({ businesses: [] });
     }
 
-    // Step 2: Get full details for each place (up to 12)
-    const places  = searchData.results.slice(0, 12);
-    const fields  = 'name,formatted_address,formatted_phone_number,website,rating,user_ratings_total,photos,opening_hours,place_id,types';
-
-    const details = await Promise.all(
-      places.map(p =>
-        fetch(`https://maps.googleapis.com/maps/api/place/details/json?place_id=${p.place_id}&fields=${fields}&key=${GOOGLE_KEY}`)
-          .then(r => r.json())
-          .then(d => d.result)
-          .catch(() => null)
-      )
-    );
-
-    // Step 3: Transform into ProfileScout format
     const typeMap = {
       restaurant:'Restaurant', food:'Restaurant', cafe:'Restaurant',
       store:'Retail', clothing_store:'Retail',
       hair_care:'Salon', beauty_salon:'Salon', spa:'Salon',
       car_repair:'Auto', car_dealer:'Auto',
-      gym:'Health', doctor:'Health', health:'Health',
+      gym:'Health', doctor:'Health',
       general_contractor:'Contractor', plumber:'Contractor', electrician:'Contractor',
       lawyer:'Legal', dentist:'Dental',
     };
 
-    const businesses = details.filter(Boolean).map((place, i) => {
+    const businesses = searchData.places.map((place, i) => {
       const hasPhotos  = !!(place.photos?.length > 0);
-      const hasHours   = !!(place.opening_hours?.weekday_text?.length);
-      const hasWebsite = !!place.website;
-      const hasPhone   = !!place.formatted_phone_number;
-      const rating     = place.rating   || null;
-      const reviews    = place.user_ratings_total || 0;
+      const hasHours   = !!(place.regularOpeningHours?.weekdayDescriptions?.length);
+      const hasWebsite = !!place.websiteUri;
+      const hasPhone   = !!place.nationalPhoneNumber;
+      const rating     = place.rating || null;
+      const reviews    = place.userRatingCount || 0;
       const likelyClaimed = hasPhone || hasHours || hasWebsite || reviews > 0;
 
       const issues = [];
@@ -78,16 +72,17 @@ app.get('/api/search', async (req, res) => {
       if (reviews === 0)  issues.push('no-reviews');
       if (rating !== null && rating < 3.5) issues.push('low-rating');
 
-      const addrParts  = (place.formatted_address || '').split(',');
-      const detectedCat = place.types?.map(t => typeMap[t]).find(Boolean) || 'Business';
+      const addrParts   = (place.formattedAddress || '').split(',');
+      const detectedCat = place.types?.map(t => typeMap[t.toLowerCase()]).find(Boolean) || 'Business';
+      const placeId     = place.id || `place_${i}`;
 
       return {
-        id:      `gpl_${place.place_id?.slice(-8) || i}`,
-        name:    place.name,
+        id:      `gpl_${placeId.slice(-8)}`,
+        name:    place.displayName?.text || 'Unknown',
         cat:     detectedCat,
         addr:    addrParts[0]?.trim() || '',
         city:    addrParts.slice(1, 3).join(',').trim() || '',
-        phone:   place.formatted_phone_number || null,
+        phone:   place.nationalPhoneNumber || null,
         website: hasWebsite,
         photos:  place.photos?.length || 0,
         hours:   hasHours,
@@ -95,7 +90,7 @@ app.get('/api/search', async (req, res) => {
         rating,
         reviews,
         issues,
-        placeId: place.place_id,
+        placeId,
       };
     });
 
@@ -107,11 +102,9 @@ app.get('/api/search', async (req, res) => {
   }
 });
 
-// ── OUTREACH: generate email/SMS via Claude ───────────────────
-// POST /api/outreach  body: { business, tone }
 app.post('/api/outreach', async (req, res) => {
   const { business, tone } = req.body;
-  if (!business) return res.status(400).json({ error: 'business is required' });
+  if (!business)      return res.status(400).json({ error: 'business is required' });
   if (!ANTHROPIC_KEY) return res.status(500).json({ error: 'Anthropic key not configured on server' });
 
   const ISSUE_LABELS = {
@@ -124,9 +117,7 @@ app.post('/api/outreach', async (req, res) => {
   };
 
   const issueList = business.issues.map(i => ISSUE_LABELS[i] || i).join(', ');
-  const isSMS     = tone === 'SMS';
-
-  const prompt = isSMS
+  const prompt = tone === 'SMS'
     ? `Write a casual SMS under 160 chars to the owner of "${business.name}" offering Google Business Profile optimization. Their issues: ${issueList}. End with a question. No subject line.`
     : `Write a ${tone.toLowerCase()} cold outreach email to the owner of "${business.name}", a ${business.cat} at ${business.addr}, ${business.city}. Their Google Business Profile issues: ${issueList}. Offer professional GBP optimization. Under 200 words. Include a subject line at the top.`;
 
