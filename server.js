@@ -37,7 +37,6 @@ app.get('/api/search', async (req, res) => {
     const searchData = await searchRes.json();
 
     if (searchData.error) {
-      console.error('Google error:', JSON.stringify(searchData.error));
       return res.status(403).json({ error: `Google API error: ${searchData.error.message}` });
     }
 
@@ -130,19 +129,29 @@ app.post('/api/outreach', async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
+        model:      'claude-opus-4-5',
         max_tokens: 1000,
         messages:   [{ role: 'user', content: prompt }],
       }),
     });
 
     const aiData = await aiRes.json();
-    const text   = aiData.content?.map(c => c.text || '').join('') || 'Could not generate outreach.';
+    console.log('Anthropic response:', JSON.stringify(aiData));
+
+    if (aiData.error) {
+      return res.status(500).json({ error: `Anthropic error: ${aiData.error.message}` });
+    }
+
+    const text = aiData.content?.map(c => c.text || '').join('') || '';
+    if (!text) {
+      return res.status(500).json({ error: 'No response from AI. Please try again.' });
+    }
+
     res.json({ text });
 
   } catch (err) {
     console.error('Outreach error:', err);
-    res.status(500).json({ error: 'Could not generate outreach. Please try again.' });
+    res.status(500).json({ error: err.message || 'Could not generate outreach. Please try again.' });
   }
 });
 
